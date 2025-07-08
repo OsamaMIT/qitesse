@@ -1,3 +1,3 @@
-Cargo.lock linguist-documentation
-Cargo.toml linguist-documentation
-/target/** linguist-vendored
+*.toml    linguist-documentation
+Cargo.lock linguist-vendored
+*.rs      linguist-language=Rust
