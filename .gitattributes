@@ -1,1 +1,3 @@
-Makefile linguist-documentation
+Cargo.lock linguist-documentation
+Cargo.toml linguist-documentation
+/target/** linguist-vendored
