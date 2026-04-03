@@ -3,7 +3,7 @@ import time
 import qitesse
 import numpy as np
 
-def qft(n: int, threads: int = None) -> "qitesse.PyCircuit":
+def qft(n: int, threads: int = None) -> "qitesse.Circuit":
     """
     Build a gate-by-gate QFT circuit for n qubits.
 
@@ -11,15 +11,15 @@ def qft(n: int, threads: int = None) -> "qitesse.PyCircuit":
       for i in 0..n-1:
         H(i)
         for j in i+1..n-1:
-          CRZ(control=i, target=j, theta = pi / 2^(j-i))
-      swap qubits via 3 CNOTs for i in 0..n/2-1
+          CP(control=i, target=j, theta = pi / 2^(j-i))
+      swap qubits via SWAP for i in 0..n/2-1
 
     Parameters:
         n (int): Number of qubits.
         threads (int, optional): Number of CPU threads to use. Defaults to None.
 
     Returns:
-        qitesse.PyCircuit: Constructed QFT circuit.
+        qitesse.Circuit: Constructed QFT circuit.
     """
     if n <= 0:
         raise ValueError("n must be positive")
@@ -36,16 +36,13 @@ def qft(n: int, threads: int = None) -> "qitesse.PyCircuit":
         gates.append(qitesse.Gate.h(i))
         for j in range(i + 1, n):
             theta = math.pi / float(1 << (j - i))  # pi / 2^(j-i)
-            gates.append(qitesse.Gate.crz(i, j, theta))
+            gates.append(qitesse.Gate.cp(i, j, theta))
 
-    # Bit-reversal swaps (swap qubit i with n-1-i) implemented via 3 CNOTs
+    # Bit-reversal swaps
     for i in range(n // 2):
         a = i
         b = n - 1 - i
-        # SWAP(a,b) = CNOT(a,b); CNOT(b,a); CNOT(a,b)
-        gates.append(qitesse.Gate.cnot(a, b))
-        gates.append(qitesse.Gate.cnot(b, a))
-        gates.append(qitesse.Gate.cnot(a, b))
+        gates.append(qitesse.Gate.swap(a, b))
 
     return qitesse.Circuit(gates)
 

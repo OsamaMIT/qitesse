@@ -6,3 +6,4 @@ __pycache__/
 .maturin/
 dist/
 .venv
+.codex

@@ -12,8 +12,10 @@ This PyPI module provides a high-level python interface for the purpose of produ
 ## Features
 
 - Performant CPU based simulation
-- Amplitude measurements on quantum circuits
-- _More soon!_
+- State-vector execution for common single-, two-, and multi-qubit gates
+- Mid-circuit `measure`, `reset`, and `barrier` operations
+- Custom unitary operations with `Gate.unitary(...)`
+- Controlled custom unitaries with `Gate.controlled_unitary(...)`
 
 ## Installation
 
@@ -36,15 +38,82 @@ To run examples:
 
 `python examples/h_example.py`
 
-`python examples/qft_example.py`
+`python examples/qft._example.py`
+
+`python examples/custom_unitary.py`
 
 ## Documentation
 _**Avaliable soon!**_
 
+## Supported Gates
+
+Single-qubit gates:
+
+- `i`
+- `x`
+- `y`
+- `z`
+- `h`
+- `s`
+- `sdg`
+- `t`
+- `tdg`
+- `rx`
+- `ry`
+- `rz`
+- `p` / `phase`
+- `u`
+
+Two-qubit gates:
+
+- `cnot` / `cx`
+- `cy`
+- `cz`
+- `ch`
+- `swap`
+- `iswap`
+- `crx`
+- `cry`
+- `crz`
+- `cp` / `cphase`
+- `cu`
+
+Three-qubit and larger:
+
+- `ccx` / `toffoli`
+- `cswap` / `fredkin`
+- `mcx`
+- `mcz`
+- `mcp` / `mcphase`
+- `controlled_unitary`
+
+Circuit operations:
+
+- `measure`
+- `reset`
+- `barrier`
+
+Custom unitaries:
+
+```python
+import numpy as np
+import qitesse
+
+hadamard = np.array([[1, 1], [1, -1]], dtype=np.complex64) / np.sqrt(2)
+
+circuit = qitesse.Circuit([
+    qitesse.Gate.unitary([0], hadamard),
+    qitesse.Gate.controlled_unitary([0], [1], hadamard),
+])
+
+state = circuit.run(2)
+```
+
+Use `run_with_measurements(num_qubits)` if the circuit contains measurement gates and you want the observed bit values back.
 
 ## Planned Features
 - Differentiable gradients
-- Implementing more quantum gates
+- Additional simulation backends
 
 ## Contributing
 Contributions are welcome! To contribute:
@@ -55,4 +124,3 @@ Contributions are welcome! To contribute:
 
 ## License
 This project is licensed under the MIT License. See the LICENSE file for details.
-
