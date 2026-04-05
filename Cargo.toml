@@ -1,8 +1,8 @@
 [package]
 name = "qitesse"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
-description = "High-performance Rust state-vector quantum simulator with Python bindings"
+description = "High-performance Rust state-vector quantum simulator with a Python API"
 
 [lib]
 name = "qitesse"

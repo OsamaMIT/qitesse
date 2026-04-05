@@ -1,0 +1,55 @@
+name: Auto Release on Version Bump
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - Cargo.toml
+  workflow_dispatch:
+
+jobs:
+  check-and-publish:
+    runs-on: ubuntu-latest
+    environment: pypi_publish
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version
+        id: check
+        uses: maybe-hello-world/pyproject-check-version@v4
+        with:
+          pyproject-path: ./pyproject.toml
+
+      - name: Set up Python
+        if: steps.check.outputs.local_version_is_higher == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build distributions
+        if: steps.check.outputs.local_version_is_higher == 'true'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --sdist -o dist
+          manylinux: auto
+
+      - name: Publish to PyPI
+        if: steps.check.outputs.local_version_is_higher == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.local_version_is_higher == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.check.outputs.local_version }}
+          name: Release v${{ steps.check.outputs.local_version }}
+          files: dist/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
