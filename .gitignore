@@ -7,3 +7,5 @@ __pycache__/
 dist/
 .venv
 .codex
+docs/_build/
+docs/api/generated/

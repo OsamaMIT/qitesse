@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "qitesse"
-version = "0.0.4"
-description = "qitesse: performant quantum circuit simulation in Python"
+version = "0.2.0"
+description = "High-throughput CPU backend for repeated evaluation of parameterized quantum circuits"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [{name = "Osama Elmahdy", email = "you@example.com"}]
@@ -16,4 +16,9 @@ classifiers = [
     "Operating System :: OS Independent",
     "Development Status :: 3 - Alpha",
     "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+
+[project.optional-dependencies]
+docs = [
+    "Sphinx>=8.2",
 ]

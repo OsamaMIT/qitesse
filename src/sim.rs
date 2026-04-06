@@ -200,6 +200,483 @@ pub fn make_controlled_unitary_gate(
     make_unitary_gate(full_targets, full_matrix)
 }
 
+#[derive(Clone, Copy)]
+pub enum ParamGateKind {
+    Rx,
+    Ry,
+    Rz,
+    Phase,
+}
+
+impl ParamGateKind {
+    pub fn mat2(self, theta: f32) -> Mat2 {
+        match self {
+            ParamGateKind::Rx => rx_mat2(theta),
+            ParamGateKind::Ry => ry_mat2(theta),
+            ParamGateKind::Rz => rz_mat2(theta),
+            ParamGateKind::Phase => phase_mat2(theta),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum SpecOp {
+    Fixed(Gate),
+    ParamSingle {
+        kind: ParamGateKind,
+        target: usize,
+        param: usize,
+    },
+}
+
+pub struct ParameterizedCircuitSpec {
+    pub num_qubits: usize,
+    pub param_names: Vec<Option<String>>,
+    pub ops: Vec<SpecOp>,
+}
+
+impl ParameterizedCircuitSpec {
+    pub fn new(num_qubits: usize) -> Result<Self, String> {
+        if num_qubits == 0 {
+            return Err("compiled circuits must have at least one qubit".to_string());
+        }
+
+        Ok(Self {
+            num_qubits,
+            param_names: Vec::new(),
+            ops: Vec::new(),
+        })
+    }
+
+    pub fn add_parameter(&mut self, name: Option<String>) -> usize {
+        let index = self.param_names.len();
+        self.param_names.push(name);
+        index
+    }
+
+    fn validate_qubit(&self, qubit: usize) -> Result<(), String> {
+        if qubit >= self.num_qubits {
+            return Err(format!(
+                "qubit index {} is out of range for {} qubits",
+                qubit, self.num_qubits
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_gate(&self, gate: &Gate) -> Result<(), String> {
+        match gate {
+            Gate::Operation(operation) => {
+                for &target in &operation.targets {
+                    self.validate_qubit(target)?;
+                }
+            }
+            Gate::Measure(qubit) | Gate::Reset(qubit) => self.validate_qubit(*qubit)?,
+            Gate::Barrier => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn add_fixed_gate(&mut self, gate: Gate) -> Result<(), String> {
+        self.validate_gate(&gate)?;
+        self.ops.push(SpecOp::Fixed(gate));
+        Ok(())
+    }
+
+    pub fn add_param_single(
+        &mut self,
+        kind: ParamGateKind,
+        target: usize,
+        param: usize,
+    ) -> Result<(), String> {
+        self.validate_qubit(target)?;
+        if param >= self.param_names.len() {
+            return Err(format!(
+                "parameter slot {} does not exist in this circuit spec",
+                param
+            ));
+        }
+
+        self.ops.push(SpecOp::ParamSingle {
+            kind,
+            target,
+            param,
+        });
+        Ok(())
+    }
+
+    pub fn compile(&self) -> Result<CompiledCircuit, String> {
+        let mut compiled_ops = Vec::with_capacity(self.ops.len());
+        let mut fixed_buffer = Vec::new();
+
+        let flush_fixed = |buffer: &mut Vec<Gate>, out: &mut Vec<CompiledOp>| {
+            if buffer.is_empty() {
+                return;
+            }
+
+            for gate in fuse_gates(buffer) {
+                out.push(CompiledOp::Fixed(gate));
+            }
+            buffer.clear();
+        };
+
+        for op in &self.ops {
+            match op {
+                SpecOp::Fixed(gate) => fixed_buffer.push(gate.clone()),
+                SpecOp::ParamSingle {
+                    kind,
+                    target,
+                    param,
+                } => {
+                    flush_fixed(&mut fixed_buffer, &mut compiled_ops);
+                    compiled_ops.push(CompiledOp::ParamSingle {
+                        kind: *kind,
+                        target: *target,
+                        param: *param,
+                    });
+                }
+            }
+        }
+
+        flush_fixed(&mut fixed_buffer, &mut compiled_ops);
+
+        Ok(CompiledCircuit {
+            num_qubits: self.num_qubits,
+            num_params: self.param_names.len(),
+            ops: compiled_ops,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub enum CompiledOp {
+    Fixed(Gate),
+    ParamSingle {
+        kind: ParamGateKind,
+        target: usize,
+        param: usize,
+    },
+}
+
+#[derive(Clone)]
+pub struct CompiledCircuit {
+    pub num_qubits: usize,
+    pub num_params: usize,
+    pub ops: Vec<CompiledOp>,
+}
+
+impl CompiledCircuit {
+    fn validate_params(&self, params: &[f32]) -> Result<(), String> {
+        if params.len() != self.num_params {
+            return Err(format!(
+                "parameter vector has length {}, expected {}",
+                params.len(),
+                self.num_params
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn run_into(&self, params: &[f32], state_vector: &mut StateVector) -> Result<(), String> {
+        self.validate_params(params)?;
+        if state_vector.num_qubits != self.num_qubits {
+            return Err(format!(
+                "state vector has {} qubits, compiled circuit expects {}",
+                state_vector.num_qubits, self.num_qubits
+            ));
+        }
+
+        let mut rng = thread_rng();
+        for op in &self.ops {
+            match op {
+                CompiledOp::Fixed(gate) => match gate {
+                    Gate::Operation(operation) => state_vector.apply_operation(operation)?,
+                    Gate::Measure(qubit) => {
+                        let _ = state_vector.measure_qubit(*qubit, &mut rng)?;
+                    }
+                    Gate::Reset(qubit) => state_vector.reset_qubit(*qubit, &mut rng)?,
+                    Gate::Barrier => {}
+                },
+                CompiledOp::ParamSingle {
+                    kind,
+                    target,
+                    param,
+                } => {
+                    let matrix = kind.mat2(params[*param]);
+                    state_vector.apply_mat2(*target, &matrix);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn execution_context(&self) -> ExecutionContext {
+        ExecutionContext::new(self.num_qubits)
+    }
+
+    pub fn run_statevector(&self, params: &[f32]) -> Result<StateVector, String> {
+        let mut state_vector = StateVector::new(self.num_qubits);
+        self.run_into(params, &mut state_vector)?;
+        Ok(state_vector)
+    }
+
+    pub fn run_statevector_with_context<'a>(
+        &self,
+        params: &[f32],
+        context: &'a mut ExecutionContext,
+    ) -> Result<&'a StateVector, String> {
+        context.prepare(self.num_qubits)?;
+        self.run_into(params, &mut context.state_vector)?;
+        Ok(&context.state_vector)
+    }
+
+    pub fn expectation(&self, params: &[f32], observable: &Observable) -> Result<f32, String> {
+        let state_vector = self.run_statevector(params)?;
+        state_vector.expectation(observable)
+    }
+
+    pub fn expectation_with_context(
+        &self,
+        params: &[f32],
+        observable: &Observable,
+        context: &mut ExecutionContext,
+    ) -> Result<f32, String> {
+        let state = self.run_statevector_with_context(params, context)?;
+        state.expectation(observable)
+    }
+
+    pub fn gradient(&self, params: &[f32], observable: &Observable) -> Result<Vec<f32>, String> {
+        let mut context = self.execution_context();
+        self.gradient_with_context(params, observable, &mut context)
+    }
+
+    pub fn value_and_gradient(
+        &self,
+        params: &[f32],
+        observable: &Observable,
+    ) -> Result<(f32, Vec<f32>), String> {
+        let mut context = self.execution_context();
+        self.value_and_gradient_with_context(params, observable, &mut context)
+    }
+
+    pub fn gradient_with_context(
+        &self,
+        params: &[f32],
+        observable: &Observable,
+        context: &mut ExecutionContext,
+    ) -> Result<Vec<f32>, String> {
+        let (_, gradient) = self.value_and_gradient_with_context(params, observable, context)?;
+        Ok(gradient)
+    }
+
+    pub fn value_and_gradient_with_context(
+        &self,
+        params: &[f32],
+        observable: &Observable,
+        context: &mut ExecutionContext,
+    ) -> Result<(f32, Vec<f32>), String> {
+        self.validate_params(params)?;
+        observable.validate(self.num_qubits)?;
+
+        let value = self.expectation_with_context(params, observable, context)?;
+        if self.num_params == 0 {
+            return Ok((value, Vec::new()));
+        }
+
+        let mut shifted = params.to_vec();
+        let mut gradient = vec![0.0f32; self.num_params];
+
+        for param_index in 0..self.num_params {
+            let original = shifted[param_index];
+
+            shifted[param_index] = original + std::f32::consts::FRAC_PI_2;
+            let plus = self.expectation_with_context(&shifted, observable, context)?;
+
+            shifted[param_index] = original - std::f32::consts::FRAC_PI_2;
+            let minus = self.expectation_with_context(&shifted, observable, context)?;
+
+            shifted[param_index] = original;
+            gradient[param_index] = 0.5 * (plus - minus);
+        }
+
+        Ok((value, gradient))
+    }
+
+    pub fn batch_expectation(
+        &self,
+        params_batch: &[f32],
+        batch_size: usize,
+        observable: &Observable,
+    ) -> Result<Vec<f32>, String> {
+        observable.validate(self.num_qubits)?;
+
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+        if self.num_params == 0 {
+            let value = self.expectation(&[], observable)?;
+            return Ok(vec![value; batch_size]);
+        }
+        let expected = batch_size
+            .checked_mul(self.num_params)
+            .ok_or_else(|| "parameter batch is too large".to_string())?;
+        if params_batch.len() != expected {
+            return Err(format!(
+                "parameter batch contains {} values, expected {} for shape ({}, {})",
+                params_batch.len(),
+                expected,
+                batch_size,
+                self.num_params
+            ));
+        }
+
+        let chunk = self.num_params;
+        let results = params_batch
+            .par_chunks(chunk)
+            .map_init(
+                || self.execution_context(),
+                |context, params| self.expectation_with_context(params, observable, context),
+            )
+            .collect::<Result<Vec<f32>, String>>()?;
+
+        Ok(results)
+    }
+
+    pub fn batch_gradient(
+        &self,
+        params_batch: &[f32],
+        batch_size: usize,
+        observable: &Observable,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let (_, gradients) = self.batch_value_and_gradient(params_batch, batch_size, observable)?;
+        Ok(gradients)
+    }
+
+    pub fn batch_value_and_gradient(
+        &self,
+        params_batch: &[f32],
+        batch_size: usize,
+        observable: &Observable,
+    ) -> Result<(Vec<f32>, Vec<Vec<f32>>), String> {
+        observable.validate(self.num_qubits)?;
+
+        if batch_size == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if self.num_params == 0 {
+            let values = self.batch_expectation(params_batch, batch_size, observable)?;
+            return Ok((values, vec![Vec::new(); batch_size]));
+        }
+        let expected = batch_size
+            .checked_mul(self.num_params)
+            .ok_or_else(|| "parameter batch is too large".to_string())?;
+        if params_batch.len() != expected {
+            return Err(format!(
+                "parameter batch contains {} values, expected {} for shape ({}, {})",
+                params_batch.len(),
+                expected,
+                batch_size,
+                self.num_params
+            ));
+        }
+
+        let chunk = self.num_params;
+        let results = params_batch
+            .par_chunks(chunk)
+            .map_init(
+                || self.execution_context(),
+                |context, params| self.value_and_gradient_with_context(params, observable, context),
+            )
+            .collect::<Result<Vec<(f32, Vec<f32>)>, String>>()?;
+
+        let mut values = Vec::with_capacity(batch_size);
+        let mut gradients = Vec::with_capacity(batch_size);
+        for (value, gradient) in results {
+            values.push(value);
+            gradients.push(gradient);
+        }
+
+        Ok((values, gradients))
+    }
+}
+
+pub struct ExecutionContext {
+    pub state_vector: StateVector,
+}
+
+impl ExecutionContext {
+    pub fn new(num_qubits: usize) -> Self {
+        Self {
+            state_vector: StateVector::new(num_qubits),
+        }
+    }
+
+    pub fn prepare(&mut self, num_qubits: usize) -> Result<(), String> {
+        if self.state_vector.num_qubits != num_qubits {
+            self.state_vector = StateVector::new(num_qubits);
+        } else {
+            self.state_vector.reset_zero();
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Pauli {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Clone)]
+pub struct PauliTerm {
+    pub coefficient: f32,
+    pub ops: Vec<(usize, Pauli)>,
+}
+
+impl PauliTerm {
+    pub fn new(coefficient: f32, mut ops: Vec<(usize, Pauli)>) -> Result<Self, String> {
+        let qubits: Vec<usize> = ops.iter().map(|(qubit, _)| *qubit).collect();
+        ensure_unique_qubits(&qubits)?;
+        ops.sort_by_key(|(qubit, _)| *qubit);
+        Ok(Self { coefficient, ops })
+    }
+}
+
+#[derive(Clone)]
+pub struct Observable {
+    pub terms: Vec<PauliTerm>,
+}
+
+impl Observable {
+    pub fn new(terms: Vec<PauliTerm>) -> Result<Self, String> {
+        if terms.is_empty() {
+            return Err("observable must contain at least one term".to_string());
+        }
+        Ok(Self { terms })
+    }
+
+    pub fn single(pauli: Pauli, qubit: usize, coefficient: f32) -> Result<Self, String> {
+        Self::new(vec![PauliTerm::new(coefficient, vec![(qubit, pauli)])?])
+    }
+
+    pub fn validate(&self, num_qubits: usize) -> Result<(), String> {
+        for term in &self.terms {
+            for &(qubit, _) in &term.ops {
+                if qubit >= num_qubits {
+                    return Err(format!(
+                        "observable references qubit {} but state vector only has {} qubits",
+                        qubit, num_qubits
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn i_matrix() -> Vec<C32> {
     vec![c32(1.0, 0.0), c32(0.0, 0.0), c32(0.0, 0.0), c32(1.0, 0.0)]
 }
@@ -225,6 +702,15 @@ pub fn phase_matrix(theta: f32) -> Vec<C32> {
     vec![c32(1.0, 0.0), c32(0.0, 0.0), c32(0.0, 0.0), exp_i(theta)]
 }
 
+pub fn phase_mat2(theta: f32) -> Mat2 {
+    Mat2 {
+        m00: c32(1.0, 0.0),
+        m01: c32(0.0, 0.0),
+        m10: c32(0.0, 0.0),
+        m11: exp_i(theta),
+    }
+}
+
 pub fn rz_matrix(theta: f32) -> Vec<C32> {
     vec![
         exp_i(-theta / 2.0),
@@ -232,6 +718,15 @@ pub fn rz_matrix(theta: f32) -> Vec<C32> {
         c32(0.0, 0.0),
         exp_i(theta / 2.0),
     ]
+}
+
+pub fn rz_mat2(theta: f32) -> Mat2 {
+    Mat2 {
+        m00: exp_i(-theta / 2.0),
+        m01: c32(0.0, 0.0),
+        m10: c32(0.0, 0.0),
+        m11: exp_i(theta / 2.0),
+    }
 }
 
 pub fn rx_matrix(theta: f32) -> Vec<C32> {
@@ -245,6 +740,17 @@ pub fn rx_matrix(theta: f32) -> Vec<C32> {
     ]
 }
 
+pub fn rx_mat2(theta: f32) -> Mat2 {
+    let cos = (theta / 2.0).cos();
+    let sin = (theta / 2.0).sin();
+    Mat2 {
+        m00: c32(cos, 0.0),
+        m01: c32(0.0, -sin),
+        m10: c32(0.0, -sin),
+        m11: c32(cos, 0.0),
+    }
+}
+
 pub fn ry_matrix(theta: f32) -> Vec<C32> {
     let cos = (theta / 2.0).cos();
     let sin = (theta / 2.0).sin();
@@ -254,6 +760,17 @@ pub fn ry_matrix(theta: f32) -> Vec<C32> {
         c32(sin, 0.0),
         c32(cos, 0.0),
     ]
+}
+
+pub fn ry_mat2(theta: f32) -> Mat2 {
+    let cos = (theta / 2.0).cos();
+    let sin = (theta / 2.0).sin();
+    Mat2 {
+        m00: c32(cos, 0.0),
+        m01: c32(-sin, 0.0),
+        m10: c32(sin, 0.0),
+        m11: c32(cos, 0.0),
+    }
 }
 
 pub fn u_matrix(theta: f32, phi: f32, lambda: f32) -> Vec<C32> {
@@ -395,6 +912,13 @@ impl StateVector {
         Self { num_qubits, amps }
     }
 
+    pub fn reset_zero(&mut self) {
+        for amplitude in &mut self.amps {
+            *amplitude = c32(0.0, 0.0);
+        }
+        self.amps[0] = c32(1.0, 0.0);
+    }
+
     fn validate_targets(&self, targets: &[usize]) -> Result<(), String> {
         ensure_unique_qubits(targets)?;
         for &target in targets {
@@ -515,6 +1039,51 @@ impl StateVector {
         let distribution = WeightedIndex::new(&probabilities).unwrap();
         let mut rng = thread_rng();
         (0..shots).map(|_| distribution.sample(&mut rng)).collect()
+    }
+
+    fn expectation_term(&self, term: &PauliTerm) -> C32 {
+        let mut total = c32(0.0, 0.0);
+
+        for (index, amplitude) in self.amps.iter().enumerate() {
+            let mut partner = index;
+            let mut phase = c32(1.0, 0.0);
+
+            for &(qubit, pauli) in &term.ops {
+                let bit = (index >> qubit) & 1usize;
+                match pauli {
+                    Pauli::X => {
+                        partner ^= 1usize << qubit;
+                    }
+                    Pauli::Y => {
+                        partner ^= 1usize << qubit;
+                        phase *= if bit == 0 {
+                            c32(0.0, 1.0)
+                        } else {
+                            c32(0.0, -1.0)
+                        };
+                    }
+                    Pauli::Z => {
+                        if bit == 1 {
+                            phase = -phase;
+                        }
+                    }
+                }
+            }
+
+            total += amplitude.conj() * phase * self.amps[partner];
+        }
+
+        total * term.coefficient
+    }
+
+    pub fn expectation(&self, observable: &Observable) -> Result<f32, String> {
+        observable.validate(self.num_qubits)?;
+        let value = observable
+            .terms
+            .iter()
+            .fold(c32(0.0, 0.0), |sum, term| sum + self.expectation_term(term));
+
+        Ok(value.re)
     }
 }
 
@@ -721,5 +1290,125 @@ mod tests {
         let mut expected = vec![c32(0.0, 0.0); 8];
         expected[7] = c32(1.0, 0.0);
         assert_state_close(&state.amps, &expected);
+    }
+
+    #[test]
+    fn compiled_circuit_binds_parameters_inside_rust() {
+        let mut spec = ParameterizedCircuitSpec::new(1).unwrap();
+        let theta = spec.add_parameter(Some("theta".to_string()));
+        spec.add_param_single(ParamGateKind::Ry, 0, theta).unwrap();
+
+        let compiled = spec.compile().unwrap();
+        let state = compiled.run_statevector(&[std::f32::consts::PI]).unwrap();
+        assert_state_close(&state.amps, &[c32(0.0, 0.0), c32(1.0, 0.0)]);
+    }
+
+    #[test]
+    fn compiled_expectation_matches_known_value() {
+        let mut spec = ParameterizedCircuitSpec::new(1).unwrap();
+        let theta = spec.add_parameter(Some("theta".to_string()));
+        spec.add_param_single(ParamGateKind::Ry, 0, theta).unwrap();
+
+        let compiled = spec.compile().unwrap();
+        let observable = Observable::single(Pauli::Z, 0, 1.0).unwrap();
+        let angle = 0.37f32;
+        let value = compiled.expectation(&[angle], &observable).unwrap();
+        assert!((value - angle.cos()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn compiled_observable_supports_hamiltonians() {
+        let mut spec = ParameterizedCircuitSpec::new(2).unwrap();
+        spec.add_fixed_gate(make_unitary_gate(vec![0], h_matrix()).unwrap())
+            .unwrap();
+        spec.add_fixed_gate(make_controlled_unitary_gate(vec![0], vec![1], x_matrix()).unwrap())
+            .unwrap();
+
+        let compiled = spec.compile().unwrap();
+        let observable = Observable::new(vec![
+            PauliTerm::new(1.0, vec![(0, Pauli::X), (1, Pauli::X)]).unwrap(),
+            PauliTerm::new(1.0, vec![(0, Pauli::Z), (1, Pauli::Z)]).unwrap(),
+        ])
+        .unwrap();
+
+        let value = compiled.expectation(&[], &observable).unwrap();
+        assert!((value - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn execution_context_reuses_state_buffer() {
+        let mut spec = ParameterizedCircuitSpec::new(1).unwrap();
+        let theta = spec.add_parameter(Some("theta".to_string()));
+        spec.add_param_single(ParamGateKind::Ry, 0, theta).unwrap();
+
+        let compiled = spec.compile().unwrap();
+        let observable = Observable::single(Pauli::Z, 0, 1.0).unwrap();
+        let mut context = compiled.execution_context();
+
+        let value_a = compiled
+            .expectation_with_context(&[0.0], &observable, &mut context)
+            .unwrap();
+        let value_b = compiled
+            .expectation_with_context(&[std::f32::consts::PI], &observable, &mut context)
+            .unwrap();
+
+        assert!((value_a - 1.0).abs() < 1e-4);
+        assert!((value_b + 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn compiled_batch_expectation_evaluates_multiple_parameter_vectors() {
+        let mut spec = ParameterizedCircuitSpec::new(1).unwrap();
+        let theta = spec.add_parameter(Some("theta".to_string()));
+        spec.add_param_single(ParamGateKind::Ry, 0, theta).unwrap();
+
+        let compiled = spec.compile().unwrap();
+        let observable = Observable::single(Pauli::Z, 0, 1.0).unwrap();
+        let angles = [0.0f32, std::f32::consts::PI / 2.0, std::f32::consts::PI];
+
+        let values = compiled
+            .batch_expectation(&angles, 3, &observable)
+            .unwrap();
+
+        assert_eq!(values.len(), 3);
+        assert!((values[0] - 1.0).abs() < 1e-4);
+        assert!(values[1].abs() < 1e-4);
+        assert!((values[2] + 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn compiled_value_and_gradient_matches_parameter_shift_reference() {
+        let mut spec = ParameterizedCircuitSpec::new(1).unwrap();
+        let theta = spec.add_parameter(Some("theta".to_string()));
+        spec.add_param_single(ParamGateKind::Ry, 0, theta).unwrap();
+
+        let compiled = spec.compile().unwrap();
+        let observable = Observable::single(Pauli::Z, 0, 1.0).unwrap();
+        let angle = 0.37f32;
+
+        let (value, gradient) = compiled.value_and_gradient(&[angle], &observable).unwrap();
+
+        assert!((value - angle.cos()).abs() < 1e-4);
+        assert_eq!(gradient.len(), 1);
+        assert!((gradient[0] + angle.sin()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn compiled_batch_gradient_evaluates_multiple_parameter_vectors() {
+        let mut spec = ParameterizedCircuitSpec::new(1).unwrap();
+        let theta = spec.add_parameter(Some("theta".to_string()));
+        spec.add_param_single(ParamGateKind::Ry, 0, theta).unwrap();
+
+        let compiled = spec.compile().unwrap();
+        let observable = Observable::single(Pauli::Z, 0, 1.0).unwrap();
+        let angles = [0.0f32, std::f32::consts::PI / 2.0, std::f32::consts::PI];
+
+        let gradients = compiled.batch_gradient(&angles, 3, &observable).unwrap();
+
+        assert_eq!(gradients.len(), 3);
+        assert_eq!(gradients[0].len(), 1);
+        assert!(gradients[0][0].abs() < 1e-4);
+        assert!((gradients[1][0] + 1.0).abs() < 1e-4);
+        assert!(gradients[2][0].abs() < 1e-4);
     }
 }
